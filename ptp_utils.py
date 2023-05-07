@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import inspect
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -34,7 +34,7 @@ def text_under_image(image: np.ndarray, text: str, text_color: Tuple[int, int, i
     return img
 
 
-def view_images(images, num_rows=1, offset_ratio=0.02):
+def view_images(images, num_rows=1, offset_ratio=0.02, show=True):
     if type(images) is list:
         num_empty = len(images) % num_rows
     elif images.ndim == 4:
@@ -58,7 +58,12 @@ def view_images(images, num_rows=1, offset_ratio=0.02):
                 i * num_cols + j]
 
     pil_img = Image.fromarray(image_)
-    display(pil_img)
+
+    if show:
+        display(pil_img)
+    
+    #for extracting each image
+    return images
 
 
 def diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource=False):
@@ -159,9 +164,13 @@ def text2image_ldm_stable(
         context = torch.cat(context)
     latent, latents = init_latent(latent, model, height, width, generator, batch_size)
     
+    eta = 0
+    accepts_eta = "eta" in set(inspect.signature(model.scheduler.step).parameters.keys())
+    extra_step_kwargs = {}
+    if accepts_eta:
+        extra_step_kwargs["eta"] = eta
     # set timesteps
-    extra_set_kwargs = {"offset": 1}
-    model.scheduler.set_timesteps(num_inference_steps, **extra_set_kwargs)
+    model.scheduler.set_timesteps(num_inference_steps, **extra_step_kwargs)
     for t in tqdm(model.scheduler.timesteps):
         latents = diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource)
     
@@ -239,7 +248,20 @@ def register_attention_control(model, controller):
 
     controller.num_att_layers = cross_att_count
 
-    
+def get_seq_encode(text: str, tokenizer):
+    return [tokenizer.decode([item]).strip("#") for item in tokenizer.encode(text)][1:-1]
+
+def make_grid(nrows, ncols, W=10, H=10, dpi=100, margin=6):
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    plt.figure(figsize=(ncols * W // dpi, nrows * H // dpi))
+    gs = gridspec.GridSpec(nrows, ncols,
+                        wspace=0.0, hspace=0.0,
+                        top=1.-0.5 / (nrows+margin), bottom=0.5 / (nrows+margin), 
+                        left=0.5 / (ncols+margin), right=1-0.5 / (ncols+margin)
+                        ) 
+    return gs
+
 def get_word_inds(text: str, word_place: int, tokenizer):
     split_text = text.split(" ")
     if type(word_place) is str:
@@ -254,7 +276,7 @@ def get_word_inds(text: str, word_place: int, tokenizer):
         for i in range(len(words_encode)):
             cur_len += len(words_encode[i])
             if ptr in word_place:
-                out.append(i + 1)
+                out.append(i + 1) #+1 for <start> token
             if cur_len >= len(split_text[ptr]):
                 ptr += 1
                 cur_len = 0
@@ -293,3 +315,28 @@ def get_time_words_attention_alpha(prompts, num_steps,
                     alpha_time_words = update_alpha_time_word(alpha_time_words, item, i, ind)
     alpha_time_words = alpha_time_words.reshape(num_steps + 1, len(prompts) - 1, 1, 1, max_num_words)
     return alpha_time_words
+
+def get_nouns_adjs_idx(prompts:List[str], tokenizer):
+    from flair.data import Sentence
+    from flair.models import SequenceTagger
+    tagger = SequenceTagger.load('pos')
+    word_idx_nested = []
+    nouns_nested = []
+    adjs_nested = []
+    for prompt in prompts:
+        sentence = Sentence(prompt)
+        tagger.predict(sentence)
+        #NNS: plural nouns, NN: singular nouns
+        noun_indices = np.array([idx for idx, token in enumerate(sentence) if token.tag == 'NN'] )
+        #JJ: adjectives, JJR: comparative adjectives, JJS: superlative adjectives
+        adj_indices = np.array([idx for idx, token in enumerate(sentence) if token.tag == 'JJ' ])
+        nouns = [token.text for token in sentence if token.tag == 'NN']
+        adjs = [token.text for token in sentence if token.tag == 'JJ']
+
+        noun_indices = get_word_inds(prompt, noun_indices, tokenizer)
+        adj_indices = get_word_inds(prompt, adj_indices, tokenizer)
+
+        word_idx_nested.append(np.concatenate((noun_indices, adj_indices)) - 1) #-1 for <start> token
+        nouns_nested.append(nouns)
+        adjs_nested.append(adjs)
+    return word_idx_nested, nouns_nested, adjs_nested
